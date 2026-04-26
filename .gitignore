@@ -1,0 +1,46 @@
+# ── Virtual Environment ────────────────────────────────
+venv/
+env/
+.venv/
+
+# ── Python Cache ───────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── ML Model Weights (large files) ────────────────────
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# ── YOLO / Ultralytics runs ────────────────────────────
+runs/
+*.yaml.bak
+
+# ── Logs & Data ────────────────────────────────────────
+*.log
+*.csv
+*.json
+!requirements.json
+
+# ── V-JEPA cloned repo (too large for git) ─────────────
+jepa/
+
+# ── OS files ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── VS Code settings ───────────────────────────────────
+.vscode/
+
+# ── Jupyter Notebooks checkpoints ─────────────────────
+.ipynb_checkpoints/
+
+# ── Environment variables / secrets ───────────────────
+.env
+*.key
