@@ -44,3 +44,10 @@ desktop.ini
 # ── Environment variables / secrets ───────────────────
 .env
 *.key
+
+
+/datasets
+
+/runs
+
+

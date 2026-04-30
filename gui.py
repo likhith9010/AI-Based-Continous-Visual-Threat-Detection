@@ -35,9 +35,9 @@ SYNONYM_MAP = {
     "mobile": "cell phone", "phone": "cell phone", "smartphone": "cell phone",
     "iphone": "cell phone", "android": "cell phone", "cellphone": "cell phone",
     "handphone": "cell phone", "telephone": "cell phone",
-    # Weapons (YOLO has no gun class, knife is closest)
-    "gun": "knife", "pistol": "knife", "weapon": "knife", "firearm": "knife",
-    "rifle": "knife", "revolver": "knife", "sword": "knife",
+    # Weapons (custom trained model uses 'weapon' class)
+    "gun": "weapon", "pistol": "weapon", "firearm": "weapon",
+    "rifle": "weapon", "revolver": "weapon", "sword": "weapon", "knife": "weapon",
     # Vehicles
     "bike": "bicycle", "cycle": "bicycle", "motorcycle": "motorbike",
     "plane": "aeroplane", "airplane": "aeroplane", "aircraft": "aeroplane",
@@ -60,8 +60,10 @@ class ThreatDetectionApp(ctk.CTk):
         self.geometry("560x500")
         self.resizable(True, True)
 
-        print("Loading YOLOv8 object detector...")
-        self.yolo_model = YOLO("yolov8n.pt")
+        print("Loading YOLOv8 object detectors...")
+        self.yolo_general = YOLO("yolov8n.pt")                                          # 80 classes (person, phone, etc.)
+        self.yolo_weapon  = YOLO("runs/detect/runs/train/guns_model-4/weights/best.pt")  # custom weapon class
+        self.yolo_model = self.yolo_general  # default; switched after threat mapping
         self.llm_model_name = "llama3:8b"
 
         self.running = False
@@ -74,11 +76,22 @@ class ThreatDetectionApp(ctk.CTk):
         self.video_file_path = ""
         self.analysis_log = []       # list of strings, capped at 100
 
+        # Video control state
+        self.paused = False
+        self.user_seeking = False
+        self.total_frames = 0
+        self.video_fps = 30.0
+        self.seek_var = tk.DoubleVar(value=0)
+        self.cap_lock = threading.Lock()  # Prevent concurrent access to VideoCapture
+
         # Widget refs (nulled before screen destroy so threads don't crash)
         self.video_label = None
         self.count_label = None
         self.status_label = None
         self.scene_textbox = None
+        self.play_pause_btn = None
+        self.time_label = None
+        self.seek_slider = None
 
         self.show_setup_screen()
 
@@ -98,11 +111,16 @@ class ThreatDetectionApp(ctk.CTk):
                 pass
         self._safe_after(_u)
 
-    def _set_count(self, n):
+    def _set_threat_status(self, is_threat):
         def _u():
             try:
                 if self.count_label and self.count_label.winfo_exists():
-                    self.count_label.configure(text=str(n))
+                    if is_threat:
+                        self.count_label.configure(text="🚨 THREAT!!", text_color="#ff4d4d")
+                        self.count_card.configure(fg_color="#4d0000")
+                    else:
+                        self.count_label.configure(text="✅ Scene Safe", text_color="#00ff88")
+                        self.count_card.configure(fg_color="#002d14")
             except Exception:
                 pass
         self._safe_after(_u)
@@ -146,6 +164,11 @@ class ThreatDetectionApp(ctk.CTk):
         self.count_label = None
         self.status_label = None
         self.scene_textbox = None
+        self.play_pause_btn = None
+        self.time_label = None
+        self.seek_slider = None
+        self.paused = False
+        self.user_seeking = False
 
         for w in self.winfo_children():
             w.destroy()
@@ -258,8 +281,19 @@ class ThreatDetectionApp(ctk.CTk):
         self.current_context = []
         self.last_llm_time = 0
         self.analysis_log = []
+        self.paused = False
+        self.user_seeking = False
+        self.seek_var.set(0)
         self.running = True
         self.yolo_class_target = ""  # will be resolved by LLM
+
+        # Get video metadata for seek bar
+        if source_type == "Video":
+            self.total_frames = self.cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            self.video_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        else:
+            self.total_frames = 0
+            self.video_fps = 30.0
 
         self.show_detection_screen()
         threading.Thread(target=self.video_loop, daemon=True).start()
@@ -300,6 +334,44 @@ class ThreatDetectionApp(ctk.CTk):
         self.video_label = ctk.CTkLabel(vc, text="Starting feed...", font=("Arial", 14))
         self.video_label.pack(expand=True, fill="both")
 
+        # Video controls (only shown in Video File mode)
+        if self.source_var.get() == "Video":
+            ctrl_bar = ctk.CTkFrame(vc, fg_color="#1a1a2e", corner_radius=0, height=90)
+            ctrl_bar.pack(fill="x", side="bottom")
+            ctrl_bar.pack_propagate(False)
+
+            # Seek slider
+            self.seek_slider = ctk.CTkSlider(
+                ctrl_bar, from_=0, to=max(self.total_frames - 1, 1),
+                variable=self.seek_var, number_of_steps=int(self.total_frames),
+                button_color="#d62828", progress_color="#d62828"
+            )
+            self.seek_slider.pack(fill="x", padx=16, pady=(10, 2))
+            self.seek_slider.bind("<ButtonPress-1>",   lambda e: self._on_seek_press())
+            self.seek_slider.bind("<ButtonRelease-1>", lambda e: self._on_seek_release())
+
+            # Buttons row
+            btn_row = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
+            btn_row.pack(pady=(2, 6))
+
+            ctk.CTkButton(btn_row, text="⏮", width=44, height=32,
+                          fg_color="#2a2a3e", hover_color="#3a3a5e",
+                          command=self._restart_video).pack(side="left", padx=4)
+            ctk.CTkButton(btn_row, text="⏪ 10s", width=64, height=32,
+                          fg_color="#2a2a3e", hover_color="#3a3a5e",
+                          command=lambda: self._seek_relative(-10)).pack(side="left", padx=4)
+            self.play_pause_btn = ctk.CTkButton(
+                btn_row, text="⏸ Pause", width=90, height=32,
+                fg_color="#d62828", hover_color="#a00000",
+                command=self._toggle_pause)
+            self.play_pause_btn.pack(side="left", padx=4)
+            ctk.CTkButton(btn_row, text="10s ⏩", width=64, height=32,
+                          fg_color="#2a2a3e", hover_color="#3a3a5e",
+                          command=lambda: self._seek_relative(10)).pack(side="left", padx=4)
+            self.time_label = ctk.CTkLabel(btn_row, text="0:00 / 0:00",
+                                           font=("Arial", 12), text_color="gray")
+            self.time_label.pack(side="left", padx=12)
+
         # Right: analytics
         right = ctk.CTkFrame(body, corner_radius=12, width=320)
         right.grid(row=0, column=1, sticky="nsew")
@@ -307,12 +379,12 @@ class ThreatDetectionApp(ctk.CTk):
 
         ctk.CTkLabel(right, text="📊  Analytics", font=("Arial", 17, "bold")).pack(pady=(14, 4))
 
-        count_card = ctk.CTkFrame(right, fg_color="#2d0000", corner_radius=10)
-        count_card.pack(fill="x", padx=14, pady=4)
-        ctk.CTkLabel(count_card, text="Threat Detections",
+        self.count_card = ctk.CTkFrame(right, fg_color="#002d14", corner_radius=10)
+        self.count_card.pack(fill="x", padx=14, pady=4)
+        ctk.CTkLabel(self.count_card, text="System Status",
                      font=("Arial", 11), text_color="gray").pack(pady=(6, 0))
-        self.count_label = ctk.CTkLabel(count_card, text="0",
-                                        font=("Arial", 40, "bold"), text_color="#ff4d4d")
+        self.count_label = ctk.CTkLabel(self.count_card, text="✅ Scene Safe",
+                                        font=("Arial", 28, "bold"), text_color="#00ff88")
         self.count_label.pack(pady=(0, 6))
 
         self.status_label = ctk.CTkLabel(right, text="🟡 Resolving threat with LLM...",
@@ -389,43 +461,141 @@ class ThreatDetectionApp(ctk.CTk):
         # Final fallback: return cleaned input
         return user_input
 
+    # ── Video Control Helpers ──────────────────────────────────────────────────
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        def _u():
+            try:
+                if self.play_pause_btn and self.play_pause_btn.winfo_exists():
+                    self.play_pause_btn.configure(
+                        text="▶ Play" if self.paused else "⏸ Pause"
+                    )
+            except Exception:
+                pass
+        self._safe_after(_u)
+
+    def _restart_video(self):
+        if self.cap:
+            with self.cap_lock:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.seek_var.set(0)
+            self.paused = False
+            def _u():
+                try:
+                    if self.play_pause_btn and self.play_pause_btn.winfo_exists():
+                        self.play_pause_btn.configure(text="⏸ Pause")
+                except Exception:
+                    pass
+            self._safe_after(_u)
+
+    def _seek_relative(self, seconds):
+        if self.cap:
+            with self.cap_lock:
+                cur = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
+                new = max(0, min(cur + seconds * self.video_fps, self.total_frames - 1))
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, new)
+
+    def _on_seek_press(self):
+        self.user_seeking = True
+
+    def _on_seek_release(self):
+        if self.cap:
+            target_frame = int(self.seek_var.get())
+            with self.cap_lock:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        self.user_seeking = False
+
+    def _fmt_time(self, frame_pos):
+        total_secs = int(frame_pos / self.video_fps) if self.video_fps else 0
+        dur_secs   = int(self.total_frames / self.video_fps) if self.video_fps else 0
+        def _fmt(s):
+            return f"{s // 60}:{s % 60:02d}"
+        return f"{_fmt(total_secs)} / {_fmt(dur_secs)}"
+
+    def _update_seek_ui(self, frame_pos):
+        def _u():
+            try:
+                if not self.user_seeking and self.seek_slider and self.seek_slider.winfo_exists():
+                    self.seek_var.set(frame_pos)
+                if self.time_label and self.time_label.winfo_exists():
+                    self.time_label.configure(text=self._fmt_time(frame_pos))
+            except Exception:
+                pass
+        self._safe_after(_u)
+
     # ── Video Loop ─────────────────────────────────────────────────────────────
     def video_loop(self):
         source_type = self.source_var.get()
         while self.running:
+            # Handle pause
+            if self.paused:
+                time.sleep(0.05)
+                continue
+
             if not self.cap or not self.cap.isOpened():
                 break
-            ret, frame = self.cap.read()
+            
+            with self.cap_lock:
+                ret, frame = self.cap.read()
+            
             if not ret:
                 if source_type == "Video":
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    with self.cap_lock:
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 else:
                     break
 
+            # Update seek bar for video mode
+            if source_type == "Video":
+                with self.cap_lock:
+                    cur_frame = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
+                self._update_seek_ui(cur_frame)
+
             detected_classes = []
 
-            # Only run YOLO after we have the mapped class (avoid false highlights)
-            results = self.yolo_model(frame, verbose=False)
-            for r in results:
+            # Run both models
+            res_general = self.yolo_general(frame, verbose=False, conf=0.25)
+            res_weapon  = self.yolo_weapon(frame, verbose=False, conf=0.6) # High threshold for custom model
+
+            # Store person boxes for conflict checking
+            person_boxes = []
+            for r in res_general:
                 for box in r.boxes:
-                    cls_id = int(box.cls[0])
-                    class_name = self.yolo_model.names[cls_id].lower()
-                    conf = float(box.conf[0])
-                    detected_classes.append(class_name)
+                    if r.names[int(box.cls[0])].lower() == "person" and float(box.conf[0]) > 0.5:
+                        person_boxes.append(box.xyxy[0].tolist())
 
-                    is_threat = bool(self.yolo_class_target and
-                                     self.yolo_class_target in class_name)
-                    color = (0, 0, 255) if is_threat else (0, 200, 80)
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if is_threat else 1)
-                    lbl = f"{'!! THREAT' if is_threat else class_name} {conf:.0%}"
-                    cv2.putText(frame, lbl, (x1, max(y1 - 10, 14)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            for results in [res_general, res_weapon]:
+                is_weapon_model = (results == res_weapon)
+                for r in results:
+                    for box in r.boxes:
+                        cls_id = int(box.cls[0])
+                        class_name = r.names[cls_id].lower()
+                        conf = float(box.conf[0])
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            if self.yolo_class_target and self.yolo_class_target in detected_classes:
-                self.detection_count += 1
-                self._set_count(self.detection_count)
+                        # Conflict Check: If weapon model detects a 'weapon' that is actually a 'person'
+                        if is_weapon_model:
+                            is_false_alarm = False
+                            for p_box in person_boxes:
+                                # Simple overlap check (Intersection over Union / simple containment)
+                                if x1 > p_box[0]-10 and y1 > p_box[1]-10 and x2 < p_box[2]+10 and y2 < p_box[3]+10:
+                                    is_false_alarm = True
+                                    break
+                            if is_false_alarm: continue
+
+                        detected_classes.append(class_name)
+                        is_threat = bool(self.yolo_class_target and
+                                         self.yolo_class_target in class_name)
+                        
+                        color = (0, 0, 255) if is_threat else (0, 200, 80)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if is_threat else 1)
+                        lbl = f"{'!! THREAT' if is_threat else class_name} {conf:.0%}"
+                        cv2.putText(frame, lbl, (x1, max(y1 - 10, 14)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            threat_found = bool(self.yolo_class_target and self.yolo_class_target in detected_classes)
+            self._set_threat_status(threat_found)
 
             self.current_context = detected_classes
 
@@ -483,12 +653,15 @@ class ThreatDetectionApp(ctk.CTk):
                 threat_present = self.yolo_class_target in self.current_context
 
                 prompt = (
-                    f"You are a concise security AI.\n"
-                    f"Objects detected in frame: {objects_str}.\n"
-                    f"Monitored threat: \"{self.threat_target}\" (YOLO class: {self.yolo_class_target}).\n"
-                    f"Threat visible right now: {'YES' if threat_present else 'NO'}.\n\n"
-                    f"In 2-3 sentences: describe the scene, state if the threat is present, "
-                    f"and if YES — is this a real concern or a false alarm?"
+                    f"You are a video analysis AI evaluating a scene based on detected objects.\n"
+                    f"Objects currently visible: {objects_str}.\n"
+                    f"The user specifically asked to monitor for: \"{self.threat_target}\".\n"
+                    f"Is the trigger object detected? {'YES' if threat_present else 'NO'}.\n\n"
+                    f"Instructions:\n"
+                    f"1. Explain what is happening in the scene based on the objects.\n"
+                    f"2. Evaluate HOW CONCERNING the situation is relative to the user's explicit request (\"{self.threat_target}\"). For example, if they are looking for cheating, does the combination of objects suggest a high risk of cheating?\n"
+                    f"3. If the trigger is YES, you MUST start your response exactly with 'Threat recorded: {self.threat_target}.' and then provide your evaluation.\n"
+                    f"4. Keep your response concise (2-3 sentences)."
                 )
 
                 self._set_status("🟡 Thinking...")
