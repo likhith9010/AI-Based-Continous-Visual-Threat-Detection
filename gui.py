@@ -8,6 +8,8 @@ from ultralytics import YOLO
 import tkinter as tk
 from tkinter import filedialog
 from datetime import datetime
+import base64
+from vjepa_engine import VJEPAEngine
 
 
 
@@ -84,6 +86,13 @@ class ThreatDetectionApp(ctk.CTk):
         self.seek_var = tk.DoubleVar(value=0)
         self.cap_lock = threading.Lock()  # Prevent concurrent access to VideoCapture
 
+        # Three-Stream State
+        self.vjepa_engine = VJEPAEngine()
+        self.threat_override = None            # Signal from YOLO to Vision stream
+        self.latest_frame = None               # Shared frame for vision stream
+        self.anomaly_info = {"score": 0.0, "label": "Normal"}
+        self.vision_model_name = "gemma4:e2b"  # Stream 3 model
+
         # Widget refs (nulled before screen destroy so threads don't crash)
         self.video_label = None
         self.count_label = None
@@ -135,25 +144,29 @@ class ThreatDetectionApp(ctk.CTk):
                 pass
         self._safe_after(_u)
 
-    def _append_analysis(self, text):
+    def _append_analysis(self, text, is_threat=False):
         """Append a timestamped entry; cap log at 100, prune oldest 25 when full."""
         ts = datetime.now().strftime("%H:%M:%S")
         entry = f"[{ts}]\n{text}\n"
-        self.analysis_log.append(entry)
+        self.analysis_log.append((entry, is_threat))
         if len(self.analysis_log) > 100:
-            self.analysis_log = self.analysis_log[25:]  # drop oldest 25
+            self.analysis_log = self.analysis_log[25:]
 
         def _u():
             try:
                 if self.scene_textbox and self.scene_textbox.winfo_exists():
                     self.scene_textbox.configure(state="normal")
                     self.scene_textbox.delete("0.0", "end")
+                    # Configure threat tag (No 'font' allowed in CTk scaling)
+                    self.scene_textbox.tag_config("threat", foreground="#ff3333")
                     # Newest first
-                    self.scene_textbox.insert("0.0", "\n─────────────────────\n".join(
-                        reversed(self.analysis_log)
-                    ))
+                    for e, thr in reversed(self.analysis_log):
+                        if thr:
+                            self.scene_textbox.insert("end", e + "\n─────────────────────\n", "threat")
+                        else:
+                            self.scene_textbox.insert("end", e + "\n─────────────────────\n")
                     self.scene_textbox.configure(state="disabled")
-                    self.scene_textbox.see("0.0")  # scroll to top (newest)
+                    self.scene_textbox.see("1.0")
             except Exception:
                 pass
         self._safe_after(_u)
@@ -574,11 +587,10 @@ class ThreatDetectionApp(ctk.CTk):
                         conf = float(box.conf[0])
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                        # Conflict Check: If weapon model detects a 'weapon' that is actually a 'person'
+                        # Conflict resolution
                         if is_weapon_model:
                             is_false_alarm = False
                             for p_box in person_boxes:
-                                # Simple overlap check (Intersection over Union / simple containment)
                                 if x1 > p_box[0]-10 and y1 > p_box[1]-10 and x2 < p_box[2]+10 and y2 < p_box[3]+10:
                                     is_false_alarm = True
                                     break
@@ -594,8 +606,15 @@ class ThreatDetectionApp(ctk.CTk):
                         cv2.putText(frame, lbl, (x1, max(y1 - 10, 14)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
+            # Update V-JEPA and Latest Frame for Vision Stream
+            self.vjepa_engine.add_frame(frame)
+            self.latest_frame = frame.copy()
+
             threat_found = bool(self.yolo_class_target and self.yolo_class_target in detected_classes)
             self._set_threat_status(threat_found)
+
+            if threat_found:
+                self.threat_override = self.threat_target # Signal to Vision loop
 
             self.current_context = detected_classes
 
@@ -618,9 +637,9 @@ class ThreatDetectionApp(ctk.CTk):
 
             time.sleep(0.03)
 
-    # ── LLM Loop ───────────────────────────────────────────────────────────────
+    # ── LLM & Vision Streams ───────────────────────────────────────────────────
     def llm_loop(self):
-        # Step 1: Resolve user threat to YOLO class
+        """Step 1: Resolve user threat to YOLO class."""
         self._set_status("🟡 Asking LLM to map threat target...")
         self.yolo_class_target = self._resolve_threat_with_llm()
 
@@ -636,61 +655,85 @@ class ThreatDetectionApp(ctk.CTk):
         self._safe_after(_update_badge)
         self._set_status("🟢 Monitoring...")
 
-        # Immediately log the mapping
         self._append_analysis(
             f"✅ Threat mapped:\nUser: \"{self.threat_target}\"\nYOLO class: [{self.yolo_class_target}]"
         )
 
-        # Wait for video to start populating context
-        time.sleep(3)
+        # Launch the Stream 3: Continuous Vision AI
+        threading.Thread(target=self.vision_loop, daemon=True).start()
 
-        # Step 2: Periodic scene analysis
+    def vision_loop(self):
+        """Stream 3: The Continuous Vision AI using Gemma 4."""
+        import base64
+        time.sleep(3) # Wait for buffer
+
         while self.running:
-            now = time.time()
-            if now - self.last_llm_time >= 8 and self.current_context:
-                self.last_llm_time = now
-                objects_str = ", ".join(sorted(set(self.current_context)))
-                threat_present = self.yolo_class_target in self.current_context
+            try:
+                if self.latest_frame is None or self.paused:
+                    time.sleep(1)
+                    continue
 
-                prompt = (
-                    f"You are a video analysis AI evaluating a scene based on detected objects.\n"
-                    f"Objects currently visible: {objects_str}.\n"
-                    f"The user specifically asked to monitor for: \"{self.threat_target}\".\n"
-                    f"Is the trigger object detected? {'YES' if threat_present else 'NO'}.\n\n"
-                    f"Instructions:\n"
-                    f"1. Explain what is happening in the scene based on the objects.\n"
-                    f"2. Evaluate HOW CONCERNING the situation is relative to the user's explicit request (\"{self.threat_target}\"). For example, if they are looking for cheating, does the combination of objects suggest a high risk of cheating?\n"
-                    f"3. If the trigger is YES, you MUST start your response exactly with 'Threat recorded: {self.threat_target}.' and then provide your evaluation.\n"
-                    f"4. Keep your response concise (2-3 sentences)."
-                )
+                # 1. Get Temporal Anomaly Data
+                self.anomaly_info = self.vjepa_engine.compute_anomaly()
+                
+                # 2. Encode Frame
+                _, buffer = cv2.imencode(".jpg", self.latest_frame)
+                img_base64 = base64.b64encode(buffer).decode("utf-8")
 
-                self._set_status("🟡 Thinking...")
-
-                try:
-                    resp = requests.post(
-                        "http://localhost:11434/api/generate",
-                        json={"model": self.llm_model_name, "prompt": prompt, "stream": False},
-                        timeout=60
+                vjepa_ctx = f"V-JEPA Anomaly Score: {self.anomaly_info['score']:.2f} ({self.anomaly_info['label']})"
+                
+                if self.threat_override:
+                    prompt = (
+                        f"ALERT: The automated system suspects a '{self.threat_override}' is present.\n"
+                        f"Context: {vjepa_ctx}.\n\n"
+                        f"Instructions:\n"
+                        f"1. LOOK CAREFULLY at the scene. Is there actually a {self.threat_override} or anything suspicious?\n"
+                        f"2. If YES, start your response with 'Threat recorded: {self.threat_override}.' then describe the person's actions.\n"
+                        f"3. If NO (false alarm), just describe the scene normally in 2 sentences WITHOUT using the 'Threat recorded' phrase.\n"
+                        f"4. Be honest and accurate."
                     )
-                    if resp.status_code == 200:
-                        reply = resp.json().get("response", "").strip()
-                        label = "🚨 THREAT DETECTED" if threat_present else "✅ Scene Clear"
-                        self._append_analysis(f"{label}\n\n{reply}")
-                        self._set_status("🟢 Monitoring...")
+                    self.threat_override = None # Reset flag
+                else:
+                    prompt = (
+                        f"Describe what is happening in this scene in 2-3 sentences.\n"
+                        f"Context: {vjepa_ctx}.\n"
+                        f"If the scene is safe, just describe the activity."
+                    )
+
+                self._set_status("🟡 Vision AI Thinking...")
+
+                resp = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": self.vision_model_name,
+                        "prompt": prompt,
+                        "images": [img_base64],
+                        "stream": False
+                    },
+                    timeout=60
+                )
+                if resp.status_code == 200:
+                    reply = resp.json().get("response", "").strip()
+                    is_threat = "Threat recorded:" in reply or "Threat recorded" in reply
+                    
+                    if is_threat:
+                        border = "🚨" * 12
+                        log_entry = f"{border}\n🚨 THREAT DETECTED 🚨\n{border}\n\n{reply.upper()}\n\n{vjepa_ctx}"
+                        self._append_analysis(log_entry, is_threat=True)
                     else:
-                        self._append_analysis(f"⚠ Ollama error: HTTP {resp.status_code}")
-                        self._set_status("🔴 LLM Error")
+                        log_entry = f"👁 Scene Insight:\n{reply}\n({vjepa_ctx})"
+                        self._append_analysis(log_entry, is_threat=False)
+                        
+                    self._set_status("🟢 Monitoring...")
+                else:
+                    self._set_status("🔴 Vision API Error")
 
-                except requests.exceptions.ConnectionError:
-                    self._append_analysis("❌ Cannot reach Ollama.\nMake sure it is running.")
-                    self._set_status("🔴 Ollama offline")
-                except requests.exceptions.Timeout:
-                    self._append_analysis("⏱ LLM timed out. Will retry next cycle.")
-                    self._set_status("🟠 Timeout")
-                except Exception as e:
-                    self._append_analysis(f"Unexpected error:\n{str(e)}")
+            except Exception as e:
+                self._append_analysis(f"❌ Vision Loop Error:\n{str(e)}")
+                self._set_status("🔴 Error in Vision Thread")
+                time.sleep(2)
 
-            time.sleep(1)
+            time.sleep(8) # Vision cycle timing
 
 
 if __name__ == "__main__":
